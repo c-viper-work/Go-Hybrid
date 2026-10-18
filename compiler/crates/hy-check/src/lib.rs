@@ -428,9 +428,9 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
         usize,
         usize,
         &hy_syntax::Block,
-        std::collections::HashSet<String>,
+        std::collections::HashSet<(usize, String)>,
     )> = Vec::new();
-    let mut reported_backedge: std::collections::HashSet<String> =
+    let mut reported_backedge: std::collections::HashSet<(usize, String)> =
         std::collections::HashSet::new();
 
     // Pass B: statements in source order.
@@ -472,9 +472,12 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
             let pre_moved = st
                 .env
                 .iter()
-                .chain(st.scopes.iter().flat_map(|s| s.iter()))
-                .filter(|(_, b)| b.moved.is_some())
-                .map(|(k, _)| k.clone())
+                .map(|(name, b)| (0, name, b))
+                .chain(st.scopes.iter().take(outer_depth).enumerate().flat_map(
+                    |(i, scope)| scope.iter().map(move |(name, b)| (i + 1, name, b)),
+                ))
+                .filter(|(_, _, b)| b.moved.is_some())
+                .map(|(depth, name, _)| (depth, name.clone()))
                 .collect();
             active_loops.push((idx, flat.loop_end_of(idx), outer_depth, lbody, pre_moved));
         }

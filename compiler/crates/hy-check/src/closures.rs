@@ -968,12 +968,15 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
         }
         Stmt::For { kind, body, .. } => {
             let outer_depth = st.scopes.len();
-            let pre_moved: std::collections::HashSet<String> = st
+            let pre_moved: std::collections::HashSet<(usize, String)> = st
                 .env
                 .iter()
-                .chain(st.scopes.iter().flat_map(|s| s.iter()))
-                .filter(|(_, b)| b.moved.is_some())
-                .map(|(k, _)| k.clone())
+                .map(|(name, b)| (0, name, b))
+                .chain(st.scopes.iter().take(outer_depth).enumerate().flat_map(
+                    |(i, scope)| scope.iter().map(move |(name, b)| (i + 1, name, b)),
+                ))
+                .filter(|(_, _, b)| b.moved.is_some())
+                .map(|(depth, name, _)| (depth, name.clone()))
                 .collect();
             st.scope_push(); // the loop vars' scope
             match kind {
@@ -1059,7 +1062,8 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                         .into_iter()
                         .map(|(k, v)| (k + 1, v))
                         .collect();
-                let mut reported_backedge = std::collections::HashSet::new();
+                let mut reported_backedge: std::collections::HashSet<(usize, String)> =
+                    std::collections::HashSet::new();
                 ck.check_loop_backedge(
                     st,
                     outer_depth,

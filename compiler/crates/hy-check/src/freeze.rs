@@ -90,8 +90,10 @@ fn same_or_shared(st: &FnState, a: &str, root_a: &str, b: &str, root_b: &str) ->
 
 #[derive(Clone, Copy)]
 struct LoopFlow {
-    continue_reach: bool,
-    loop_break_reach: bool,
+    unlabeled_continue_reach: bool,
+    labeled_continue_reach: bool,
+    unlabeled_break_reach: bool,
+    labeled_break_reach: bool,
     select_break_reach: Option<bool>,
 }
 
@@ -612,13 +614,24 @@ impl<'a> Checker<'a> {
         loop_stmts: &[(&hy_syntax::Stmt, usize)],
         events: &std::collections::HashMap<usize, Vec<crate::walk::ScopeEvent>>,
         loop_body: &hy_syntax::Block,
-        pre_moved: &HashSet<String>,
-        reported_backedge: &mut HashSet<String>,
+        pre_moved: &HashSet<(usize, String)>,
+        reported_backedge: &mut HashSet<(usize, String)>,
     ) {
-        if matches!(
+        let is_infinite_loop = matches!(
+            loop_stmts.first().map(|(s, _)| s),
+            Some(hy_syntax::Stmt::For { kind: hy_syntax::ForKind::Infinite, .. })
+        );
+        let trailing_exit = matches!(
             loop_body.stmts.last(),
             Some(hy_syntax::Stmt::Break { .. } | hy_syntax::Stmt::Return { .. })
-        ) && !Self::has_continue_after_loop_move(loop_body, st, pre_moved, outer_depth)
+        ) || (!is_infinite_loop
+            && matches!(
+                loop_body.stmts.last(),
+                Some(hy_syntax::Stmt::Continue { label: Some(_), .. })
+            ));
+        // LX14 continue loop leaves a finite for, just like break leaves
+        // the loop being checked; only continues targeting it can repeat it.
+        if trailing_exit && !Self::has_continue_after_loop_move(is_infinite_loop, loop_body, st, pre_moved, outer_depth)
         {
             return;
         }
@@ -629,15 +642,21 @@ impl<'a> Checker<'a> {
         }
         let popped_st = iter_st.clone();
         let mut any_loop_carried = false;
-        for (name, b) in iter_st
+        for (depth, name, b) in iter_st
             .env
             .iter_mut()
-            .chain(iter_st.scopes.iter_mut().flat_map(|s| s.iter_mut()))
+            .map(|(name, b)| (0, name, b))
+            .chain(iter_st.scopes.iter_mut().enumerate().flat_map(
+                |(i, scope)| scope.iter_mut().map(move |(name, b)| (i + 1, name, b)),
+            ))
         {
             if b.moved.is_some() {
                 let root = resolve_alias(&popped_st, name);
-                if pre_moved.contains(name)
-                    || reported_backedge.contains(&root)
+                let root_depth = popped_st.lookup_depth(&root).unwrap_or(0);
+                if pre_moved.contains(&(depth, name.clone()))
+                    || reported_backedge.contains(&(root_depth, root))
+                    || (trailing_exit && b.moved.as_ref().is_some_and(|mv|
+                        !Self::move_span_can_reach_backedge(is_infinite_loop, loop_body, mv.span)))
                 {
                     b.moved = None;
                 } else {
@@ -738,7 +757,8 @@ impl<'a> Checker<'a> {
                 let Some(mv) = moved else { continue };
                 self.emit_use_after_move(&iter_st, u, &mv);
                 let root = resolve_alias(&iter_st, &u.name);
-                reported_backedge.insert(root.clone());
+                let root_depth = iter_st.lookup_depth(&root).unwrap_or(0);
+                reported_backedge.insert((root_depth, root.clone()));
                 let mut clear_names = vec![u.name.clone(), root.clone()];
                 for a in iter_st.aliases.keys() {
                     if resolve_alias(&iter_st, a) == root {
@@ -785,31 +805,39 @@ impl<'a> Checker<'a> {
     }
 
     fn has_continue_after_loop_move(
+        is_infinite_loop: bool,
         loop_body: &hy_syntax::Block,
         st: &FnState,
-        pre_moved: &HashSet<String>,
+        pre_moved: &HashSet<(usize, String)>,
         outer_depth: usize,
     ) -> bool {
-        if !block_has_continue_for_loop(loop_body) {
+        if !block_has_continue_for_loop(is_infinite_loop, loop_body) {
             return false;
         }
         let mut outer = st.clone();
         while outer.scopes.len() > outer_depth {
             outer.scope_pop();
         }
-        outer.env.iter().chain(outer.scopes.iter().flat_map(|s| s.iter())).any(|(name, b)| {
-            !pre_moved.contains(name)
-                && b.moved.as_ref().is_some_and(|mv| Self::move_span_can_reach_backedge(loop_body, mv.span))
-        })
+        outer.env.iter().map(|(name, b)| (0, name, b))
+            .chain(outer.scopes.iter().enumerate().flat_map(
+                |(i, scope)| scope.iter().map(move |(name, b)| (i + 1, name, b)),
+            )).any(|(depth, name, b)| {
+                !pre_moved.contains(&(depth, name.clone()))
+                    && b.moved.as_ref().is_some_and(|mv|
+                        Self::move_span_can_reach_backedge(is_infinite_loop, loop_body, mv.span))
+            })
     }
 
     fn move_span_can_reach_backedge(
+        is_infinite_loop: bool,
         loop_body: &hy_syntax::Block,
         move_span: hy_diag::Span,
     ) -> bool {
         let top_flow = LoopFlow {
-            continue_reach: true,
-            loop_break_reach: false,
+            unlabeled_continue_reach: true,
+            labeled_continue_reach: is_infinite_loop,
+            unlabeled_break_reach: false,
+            labeled_break_reach: false,
             select_break_reach: None,
         };
         Self::block_move_can_reach_backedge(loop_body, move_span, true, top_flow)
@@ -835,26 +863,29 @@ impl<'a> Checker<'a> {
     ) -> bool {
         match stmt {
             hy_syntax::Stmt::Return { .. } => false,
-            hy_syntax::Stmt::Continue { .. } => flow.continue_reach,
+            hy_syntax::Stmt::Continue { label: None, .. } => flow.unlabeled_continue_reach,
+            hy_syntax::Stmt::Continue { label: Some(_), .. } => flow.labeled_continue_reach,
             hy_syntax::Stmt::Break {
                 label: Some(_), ..
-            } => flow.loop_break_reach,
+            } => flow.labeled_break_reach,
             hy_syntax::Stmt::Break { label: None, .. } => {
-                flow.select_break_reach.unwrap_or(flow.loop_break_reach)
+                flow.select_break_reach.unwrap_or(flow.unlabeled_break_reach)
             }
             hy_syntax::Stmt::Block { block, .. }
             | hy_syntax::Stmt::Managed { body: block, .. } => {
                 Self::block_can_reach_backedge(block, after_reach, flow)
             }
             hy_syntax::Stmt::If {
-                then, otherwise, ..
+                init, then, otherwise, ..
             } => {
                 let then_reach = Self::block_can_reach_backedge(then, after_reach, flow);
                 let else_reach = match otherwise.as_deref() {
                     Some(o) => Self::stmt_can_reach_backedge(o, after_reach, flow),
                     None => after_reach,
                 };
-                then_reach || else_reach
+                let branch_reach = then_reach || else_reach;
+                init.as_deref().map_or(branch_reach, |init|
+                    Self::stmt_can_reach_backedge(init, branch_reach, flow))
             }
             hy_syntax::Stmt::Match { arms, .. } => {
                 if arms.is_empty() {
@@ -876,13 +907,21 @@ impl<'a> Checker<'a> {
             hy_syntax::Stmt::For { kind, body, .. } => {
                 if matches!(kind, hy_syntax::ForKind::Infinite) {
                     let inner_flow = LoopFlow {
-                        continue_reach: false,
-                        loop_break_reach: after_reach,
+                        unlabeled_continue_reach: false,
+                        labeled_continue_reach: false,
+                        unlabeled_break_reach: after_reach,
+                        labeled_break_reach: after_reach,
                         select_break_reach: None,
                     };
                     Self::block_can_reach_backedge(body, false, inner_flow)
                 } else {
-                    after_reach
+                    after_reach || Self::block_can_reach_backedge(body, false, LoopFlow {
+                        unlabeled_continue_reach: false,
+                        labeled_continue_reach: flow.labeled_continue_reach,
+                        unlabeled_break_reach: false,
+                        labeled_break_reach: flow.labeled_break_reach,
+                        select_break_reach: None,
+                    })
                 }
             }
             hy_syntax::Stmt::Local(_)
@@ -925,20 +964,29 @@ impl<'a> Checker<'a> {
         }
         match stmt {
             hy_syntax::Stmt::Return { .. } => Some(false),
-            hy_syntax::Stmt::Continue { .. } => Some(flow.continue_reach),
+            hy_syntax::Stmt::Continue { label: None, .. } => Some(flow.unlabeled_continue_reach),
+            hy_syntax::Stmt::Continue { label: Some(_), .. } => Some(flow.labeled_continue_reach),
             hy_syntax::Stmt::Break {
                 label: Some(_), ..
-            } => Some(flow.loop_break_reach),
+            } => Some(flow.labeled_break_reach),
             hy_syntax::Stmt::Break { label: None, .. } => {
-                Some(flow.select_break_reach.unwrap_or(flow.loop_break_reach))
+                Some(flow.select_break_reach.unwrap_or(flow.unlabeled_break_reach))
             }
             hy_syntax::Stmt::Block { block, .. }
             | hy_syntax::Stmt::Managed { body: block, .. } => {
                 Self::block_move_can_reach_backedge(block, move_span, after_reach, flow)
             }
             hy_syntax::Stmt::If {
-                then, otherwise, ..
+                init, then, otherwise, ..
             } => {
+                if let Some(init) = init.as_deref() {
+                    let branch_reach = Self::block_can_reach_backedge(then, after_reach, flow)
+                        || otherwise.as_deref().map_or(after_reach, |o|
+                            Self::stmt_can_reach_backedge(o, after_reach, flow));
+                    if let Some(res) = Self::stmt_move_can_reach_backedge(init, move_span, branch_reach, flow) {
+                        return Some(res);
+                    }
+                }
                 if let Some(res) =
                     Self::block_move_can_reach_backedge(then, move_span, after_reach, flow)
                 {
@@ -984,11 +1032,21 @@ impl<'a> Checker<'a> {
                 // `select` can reach the back-edge.
                 Some(Self::stmt_can_reach_backedge(stmt, after_reach, flow))
             }
-            hy_syntax::Stmt::For { body, .. } => {
+            hy_syntax::Stmt::For { kind, body, .. } => {
                 let loop_exits = Self::stmt_can_reach_backedge(stmt, after_reach, flow);
                 let inner_flow = LoopFlow {
-                    continue_reach: loop_exits,
-                    loop_break_reach: after_reach,
+                    unlabeled_continue_reach: loop_exits,
+                    labeled_continue_reach: if matches!(kind, hy_syntax::ForKind::Infinite) {
+                        loop_exits
+                    } else {
+                        flow.labeled_continue_reach
+                    },
+                    unlabeled_break_reach: after_reach,
+                    labeled_break_reach: if matches!(kind, hy_syntax::ForKind::Infinite) {
+                        after_reach
+                    } else {
+                        flow.labeled_break_reach
+                    },
                     select_break_reach: None,
                 };
                 if let Some(res) =
@@ -1215,36 +1273,36 @@ impl<'a> Checker<'a> {
     }
 }
 
-/// Does `block` contain any `continue` statement targeting the loop whose body
-/// is `block` (i.e. not enclosed in an inner `for` loop)?
-fn block_has_continue_for_loop(block: &hy_syntax::Block) -> bool {
-    block.stmts.iter().any(stmt_has_continue_for_loop)
+/// LX14 labels skip finite loops, but stop at the nearest infinite loop.
+fn block_has_continue_for_loop(is_infinite_loop: bool, block: &hy_syntax::Block) -> bool {
+    block.stmts.iter().any(|stmt| stmt_has_continue_for_loop(is_infinite_loop, false, stmt))
 }
 
-fn stmt_has_continue_for_loop(stmt: &hy_syntax::Stmt) -> bool {
+fn stmt_has_continue_for_loop(
+    is_infinite_loop: bool,
+    inside_for: bool,
+    stmt: &hy_syntax::Stmt,
+) -> bool {
+    let in_block = |block: &hy_syntax::Block| block.stmts.iter().any(|stmt|
+        stmt_has_continue_for_loop(is_infinite_loop, inside_for, stmt));
     match stmt {
-        hy_syntax::Stmt::Continue { .. } => true,
-        hy_syntax::Stmt::If {
-            then, otherwise, ..
-        } => {
-            block_has_continue_for_loop(then)
-                || otherwise
-                    .as_deref()
-                    .map(stmt_has_continue_for_loop)
-                    .unwrap_or(false)
+        hy_syntax::Stmt::Continue { label: None, .. } => !inside_for,
+        hy_syntax::Stmt::Continue { label: Some(_), .. } => is_infinite_loop,
+        hy_syntax::Stmt::If { init, then, otherwise, .. } => {
+            init.as_deref().is_some_and(|s| stmt_has_continue_for_loop(is_infinite_loop, inside_for, s))
+                || in_block(then)
+                || otherwise.as_deref().is_some_and(|s|
+                    stmt_has_continue_for_loop(is_infinite_loop, inside_for, s))
         }
-        hy_syntax::Stmt::Match { arms, .. } => {
-            arms.iter().any(|a| block_has_continue_for_loop(&a.body))
-        }
-        hy_syntax::Stmt::Select { arms, .. } => {
-            arms.iter().any(|a| block_has_continue_for_loop(&a.body))
-        }
-        hy_syntax::Stmt::Block { block, .. } | hy_syntax::Stmt::Managed { body: block, .. } => {
-            block_has_continue_for_loop(block)
-        }
-        // A `continue` (or `continue loop`, LX14) inside an inner `for` targets
-        // that inner loop, not the outer loop.
-        hy_syntax::Stmt::For { .. } => false,
+        hy_syntax::Stmt::Match { arms, .. } =>
+            arms.iter().any(|a| in_block(&a.body)),
+        hy_syntax::Stmt::Select { arms, .. } =>
+            arms.iter().any(|a| in_block(&a.body)),
+        hy_syntax::Stmt::Block { block, .. } | hy_syntax::Stmt::Managed { body: block, .. } =>
+            in_block(block),
+        hy_syntax::Stmt::For { kind, body, .. }
+            if is_infinite_loop && !matches!(kind, hy_syntax::ForKind::Infinite) =>
+            body.stmts.iter().any(|s| stmt_has_continue_for_loop(true, true, s)),
         _ => false,
     }
 }
@@ -1257,6 +1315,314 @@ mod tests {
     fn check(src: &str) -> crate::CheckResult {
         let ast = parse_file("freeze_test.hy", src).expect("snippet parses");
         check_file(&ast)
+    }
+
+    // Exercise both the flat function walk and the recursive closure checker.
+    fn backedge_case(body: &str, reject: bool) -> crate::CheckResult {
+        let closure_body = format!("f := fn() {{ {body} }}\nf()");
+        backedge_case_in_function(&closure_body, reject);
+        backedge_case_in_function(body, reject)
+    }
+
+    fn backedge_case_in_function(body: &str, reject: bool) -> crate::CheckResult {
+        let src = format!(
+            "fn worker(m map[string]int, done chan<- bool) {{ m[\"worker\"] = 1
+                done <- true }}
+             fn main() {{
+                done := make(chan bool, 10)
+                step := 0
+                _ = step
+                {body}
+             }}"
+        );
+        let r = check(&src);
+        if reject {
+            assert_eq!(r.verdict, Verdict::Reject, "{src}\n{:?}", r.diagnostics);
+            assert!(r.diagnostics.iter().any(|d| d.code == "HYB-E3003"),
+                "{src}\n{:?}", r.diagnostics);
+        } else {
+            assert_eq!(r.verdict, Verdict::Accept, "{src}\n{:?}", r.diagnostics);
+            assert!(r.diagnostics.is_empty(), "{src}\n{:?}", r.diagnostics);
+        }
+        r
+    }
+
+    #[test]
+    fn backedge_pre_moved_identity_includes_scope_depth() {
+        for scope in ["if true", "", "loop"] {
+            for alias in [false, true] {
+                for tail in ["", "if i == 0 { continue }\nbreak"] {
+                    let binding = if alias {
+                        "fresh := map[string]int{}\nm := fresh"
+                    } else {
+                        "m := map[string]int{}"
+                    };
+                    let exit = if scope == "loop" { "break" } else { "" };
+                    backedge_case(&format!(
+                        "m := map[string]int{{}}
+                         task worker(move m, done)
+                         {scope} {{
+                           {binding}
+                           for i in 0..2 {{
+                             m[\"main\"] = i
+                             task worker(move m, done)
+                             {tail}
+                           }}
+                           {exit}
+                         }}"
+                    ), true);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn backedge_shadowed_moves_safe_when_fresh_or_exiting() {
+        for scope in ["if true", "", "loop"] {
+            for fresh in [false, true] {
+                let binding = "m := map[string]int{}";
+                let before = if fresh { "" } else { binding };
+                let within = if fresh { binding } else { "" };
+                let tail = if fresh { "continue" } else { "break" };
+                let exit = if scope == "loop" { "break" } else { "" };
+                backedge_case(&format!(
+                    "m := map[string]int{{}}
+                     task worker(move m, done)
+                     {scope} {{
+                       {before}
+                       for i in 0..2 {{
+                         {within}
+                         task worker(move m, done)
+                         {tail}
+                       }}
+                       {exit}
+                     }}"
+                ), false);
+            }
+        }
+    }
+
+    #[test]
+    fn backedge_closure_scope_shadows_previously_moved_binding() {
+        for fresh in [false, true] {
+            let binding = "m := map[string]int{}";
+            let before = if fresh { "" } else { binding };
+            let within = if fresh { binding } else { "" };
+            backedge_case(&format!(
+                "m := map[string]int{{}}
+                 task worker(move m, done)
+                 f := fn() {{
+                   {before}
+                   for i in 0..2 {{
+                     {within}
+                     task worker(move m, done)
+                   }}
+                 }}
+                 f()"
+            ), !fresh);
+        }
+    }
+
+    #[test]
+    fn backedge_reported_identity_includes_scope_depth() {
+        let r = backedge_case(
+            "m := map[string]int{}
+             for i in 0..2 { task worker(move m, done) }
+             if true {
+               m := map[string]int{}
+               for j in 0..2 { task worker(move m, done) }
+             }", true);
+        assert_eq!(r.diagnostics.iter().filter(|d| d.code == "HYB-E3003").count(), 2,
+            "{:?}", r.diagnostics);
+    }
+
+    #[test]
+    fn backedge_labeled_continue_skips_each_finite_loop_kind() {
+        for header in ["for j in 0..1", "for j in []int{1}", "for step == 0"] {
+            for tail in ["break", "return"] {
+                // Move before the nested loop exercises general reachability;
+                // move inside it exercises move-specific reachability.
+                for inside in [false, true] {
+                    let task = "task worker(move m, done)";
+                    let before = if inside { "" } else { task };
+                    let within = if inside { task } else { "" };
+                    backedge_case(&format!(
+                        "m := map[string]int{{}}
+                         loop {{
+                           m[\"main\"] = step
+                           {before}
+                           {header} {{
+                             {within}
+                             if step == 0 {{ continue loop }}
+                             break
+                           }}
+                           {tail}
+                         }}"
+                    ), true);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn backedge_labeled_break_skips_finite_loops_and_select() {
+        for header in ["for j in 0..1", "for j in []int{1}", "for step == 0"] {
+            for in_select in [false, true] {
+                for inside in [false, true] {
+                    let task = "task worker(move m, done)";
+                    let before = if inside { "" } else { task };
+                    let within = if inside { task } else { "" };
+                    let jump = "if step == 0 { step = 1\nbreak loop }";
+                    let jump = if in_select { format!("select {{ default: {{ {jump} }} }}") }
+                        else { jump.to_string() };
+                    backedge_case(&format!(
+                        "m := map[string]int{{}}
+                         loop {{
+                           m[\"main\"] = step
+                           {before}
+                           loop {{
+                             {header} {{
+                               {within}
+                               {jump}
+                               break
+                             }}
+                             return
+                           }}
+                           if step == 1 {{ continue }}
+                           break
+                         }}"
+                    ), true);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn backedge_safe_exits_and_iteration_local_moves() {
+        for header in ["for j in 0..1", "for j in []int{1}", "for step == 0"] {
+            for jump in ["break", "break loop"] {
+                backedge_case(&format!(
+                    "m := map[string]int{{}}
+                     loop {{
+                       {header} {{
+                         task worker(move m, done)
+                         {jump}
+                       }}
+                       break
+                     }}"
+                ), false);
+            }
+            // The labeled continue targets the outer loop. Its fresh local
+            // must not be treated as carried by the finite inner loop.
+            backedge_case(&format!(
+                "loop {{
+                   m := map[string]int{{}}
+                   {header} {{
+                     task worker(move m, done)
+                     if step == 0 {{ continue loop }}
+                     break
+                   }}
+                   break
+                 }}"
+            ), false);
+            // An unlabeled continue only repeats the nested finite loop.
+            backedge_case(&format!(
+                "m := map[string]int{{}}
+                 loop {{
+                   task worker(move m, done)
+                   {header} {{ continue }}
+                   break
+                 }}"
+            ), false);
+        }
+        // A deeper infinite loop captures continue loop.
+        backedge_case(
+            "m := map[string]int{}
+             loop {
+               task worker(move m, done)
+               loop { if step == 0 { continue loop }
+                      break }
+               break
+             }", false);
+    }
+
+    #[test]
+    fn backedge_labeled_jumps_safe_before_or_inside_finite_loops() {
+        for header in ["for j in 0..1", "for j in []int{1}", "for step == 0"] {
+            for inside in [false, true] {
+                for tail in ["break", "return"] {
+                    let task = "task worker(move m, done)";
+                    let before = if inside { "" } else { task };
+                    let within = if inside { task } else { "" };
+                    // continue loop skips the finite loop; m is recreated
+                    // every time the target infinite loop starts again.
+                    backedge_case(&format!(
+                        "loop {{
+                           m := map[string]int{{}}
+                           {before}
+                           {header} {{
+                             {within}
+                             continue loop
+                           }}
+                           {tail}
+                         }}"
+                    ), false);
+                    // break loop exits the checked loop, even when a finite
+                    // loop intervenes. No moved binding reaches its back-edge.
+                    backedge_case(&format!(
+                        "m := map[string]int{{}}
+                         loop {{
+                           {before}
+                           {header} {{
+                             {within}
+                             break loop
+                           }}
+                           {tail}
+                         }}"
+                    ), false);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn backedge_filters_each_move_before_trailing_exit() {
+        // a can reach continue, but b is moved only on the exiting path.
+        let r = backedge_case(
+            "a := map[string]int{}
+             b := map[string]int{}
+             loop {
+               if step == 0 {
+                 task worker(move a, done)
+                 continue
+               }
+               task worker(move b, done)
+               break
+             }", true);
+        assert_eq!(r.diagnostics.iter().filter(|d| d.code == "HYB-E3003").count(), 1,
+            "{:?}", r.diagnostics);
+    }
+
+    #[test]
+    fn backedge_if_initializer_move_uses_branch_reachability() {
+        for tail in ["break", "return"] {
+            backedge_case(&format!(
+                "m := map[string]int{{}}
+                 loop {{
+                   if n := move m; step == 0 {{
+                     task worker(move n, done)
+                     continue
+                   }}
+                   {tail}
+                 }}"
+            ), true);
+        }
+        backedge_case(
+            "m := map[string]int{}
+             loop {
+               if n := move m; step == 0 { task worker(move n, done) }
+               break
+             }", false);
     }
 
     #[test]
